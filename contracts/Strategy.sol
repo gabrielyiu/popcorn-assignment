@@ -41,7 +41,7 @@ contract Strategy is AccessControl, ReentrancyGuard {
     address public constant vDebtWstETH = 0xC96113eED8cAB59cD8A66813bCB0cEb29F06D2e4;
     address public constant vDebtWETH = 0xeA51d7853EEFb32b6ee06b1C12E6dcCA88Be0fFE;
 
-    uint256 public leverageRatio;
+    uint256 public leverageRatio = 1;
 
     /// @notice mapping from user address to staked amount
     mapping(address => uint256) public balanceOf;
@@ -59,10 +59,6 @@ contract Strategy is AccessControl, ReentrancyGuard {
         grantRole(MANAGER_ROLE, _account);
     }
 
-    function setLeverageRatio(uint256 _leverageRatio) external onlyRole(MANAGER_ROLE) {
-        leverageRatio = _leverageRatio;
-    }
-
     function deposit(uint256 _amount) external nonReentrant {
         require(_amount > 0, "Invalid amount");
         IERC20(wstETH).safeTransferFrom(msg.sender, address(this), _amount);
@@ -71,9 +67,7 @@ contract Strategy is AccessControl, ReentrancyGuard {
         totalSupply += _amount;
 
         // Supply wstETH to Aave
-        address poolAddress = IPoolAddressProvider(provider).getPool();
-        IERC20(wstETH).approve(poolAddress, _amount);
-        IPool(poolAddress).supply(wstETH, _amount, address(this), 0);
+        _supply(_amount);
 
         emit Deposit(msg.sender, _amount);
     }
@@ -96,25 +90,42 @@ contract Strategy is AccessControl, ReentrancyGuard {
     }
 
     function harvest() external onlyRole(MANAGER_ROLE) nonReentrant {
-        // get pool address via address provider
-        address poolAddress = IPoolAddressProvider(provider).getPool();
-        
         // borrow wETH from Aave
-        uint256 amountToBorrow = _calcBorrowAmount(address(this));
-        require(amountToBorrow > 0, "Cant borrow ETH");
+        uint256 amountToBorrow = _calcBorrowAmount();
+        if (amountToBorrow == 0) {
+            leverageRatio = 1;
+            return;
+        }
 
-        IERC20(wETH).approve(poolAddress, amountToBorrow);
-        IPool(poolAddress).borrow(wETH, amountToBorrow, 2, 0, address(this));
+        // borrow ETH from Aave
+        _borrow(amountToBorrow);
 
-        uint256 outAmountDebt = _swapExactInputSingle(wETH, wstETH, 3000, amountToBorrow);
-
-        // Todo
+        // mint new wstETH with borrowed ETH
+        uint256 outAmount = _swapExactInputSingle(wETH, wstETH, 3000, amountToBorrow);
+        
+        // redeposit aave to increase leverage
+        _supply(outAmount);
     }
     
-    function _calcBorrowAmount(address _user) internal view returns (uint256) {
+    function _supply(uint256 _amount) internal {
+        address poolAddress = IPoolAddressProvider(provider).getPool();
+
+        IERC20(wstETH).approve(poolAddress, _amount);
+        IPool(poolAddress).supply(wstETH, _amount, address(this), 0);
+    }
+
+    function _borrow(uint256 _amount) internal {
+        // get pool address via address provider
+        address poolAddress = IPoolAddressProvider(provider).getPool();
+
+        IERC20(wETH).approve(poolAddress, _amount);
+        IPool(poolAddress).borrow(wETH, _amount, 2, 0, address(this));
+    }
+
+    function _calcBorrowAmount() internal view returns (uint256) {
         address poolAddress = IPoolAddressProvider(provider).getPool();
         // get account data
-        (, , uint256 availableBorrowsBase, , ,) = IPool(poolAddress).getUserAccountData(_user);
+        (, , uint256 availableBorrowsBase, , ,) = IPool(poolAddress).getUserAccountData(address(this));
 
         // get ETH Price in base currency
         address priceOracleAddress = IPoolAddressProvider(provider).getPriceOracle();
