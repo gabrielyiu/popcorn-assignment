@@ -25,5 +25,9 @@ module.exports = {
         url: `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
       }
     }
+  },
+  gasReporter: {
+    enabled: true,
+    currency: "USD"
   }
 };
