@@ -8,31 +8,24 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import "./interfaces/aave/IPoolAddressProvider.sol";
 import "./interfaces/aave/IPool.sol";
-import "./interfaces/balancer/IFlashLoans.sol";
+import "./interfaces/aave/IPriceOracleGetter.sol";
 import "./interfaces/uniswap/ISwapRouter.sol";
 
 contract Strategy is AccessControl, ReentrancyGuard {
 
     using SafeERC20 for IERC20;
-
-    error NOT_BALANCER();
     
     event Deposit(address indexed user, uint256 amount);
     event Borrow(address indexed user, uint256 amount);
-    event Repay(address indexed user, uint256 amount);
     event Withdraw(address indexed user, uint256 amount);
-
-    event LeverageAdded(address indexed user, uint256 amount, uint256 debt);
 
     /// @dev Owner role to assign manager roles
     bytes32 public constant OWNER_ROLE = keccak256("OWNER_ROLE");
     /// @dev Manager role to adjust leverage ratio and call harvest function
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
-
+    
     /// @dev Aave V3 pool addresses provider
     address private constant provider = 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e;
-    /// @dev Balancer vault, flashloan fee = 0
-    address private constant balancerVault = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     /// @dev Uniswap V3 swap router
     address private constant router = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
 
@@ -50,7 +43,10 @@ contract Strategy is AccessControl, ReentrancyGuard {
 
     uint256 public leverageRatio;
 
-    uint8 private flashMode;
+    /// @notice mapping from user address to staked amount
+    mapping(address => uint256) public balanceOf;
+    /// @notice Total staked
+    uint256 public totalSupply;
 
     constructor() {
         _grantRole(OWNER_ROLE, msg.sender);
@@ -67,10 +63,14 @@ contract Strategy is AccessControl, ReentrancyGuard {
         leverageRatio = _leverageRatio;
     }
 
-    function deposit(uint256 _amount) external {
+    function deposit(uint256 _amount) external nonReentrant {
+        require(_amount > 0, "Invalid amount");
         IERC20(wstETH).safeTransferFrom(msg.sender, address(this), _amount);
 
-        // supply
+        balanceOf[msg.sender] += _amount;
+        totalSupply += _amount;
+
+        // Supply wstETH to Aave
         address poolAddress = IPoolAddressProvider(provider).getPool();
         IERC20(wstETH).approve(poolAddress, _amount);
         IPool(poolAddress).supply(wstETH, _amount, address(this), 0);
@@ -78,114 +78,53 @@ contract Strategy is AccessControl, ReentrancyGuard {
         emit Deposit(msg.sender, _amount);
     }
 
-    function borrow(uint256 _amount) external {
-        address poolAddress = IPoolAddressProvider(provider).getPool();
-        IERC20(wETH).approve(poolAddress, _amount);
-        IPool(poolAddress).borrow(wETH, _amount, 2, 0, address(this));
-        IERC20(wETH).safeTransfer(msg.sender, _amount);
-
-        emit Borrow(msg.sender, _amount);
-    }
-
-    function repay(uint256 _amount) external {
-        IERC20(wETH).safeTransferFrom(msg.sender, address(this), _amount);
-
-        address poolAddress = IPoolAddressProvider(provider).getPool();
-
-        IERC20(wETH).approve(poolAddress, _amount);
-        IPool(poolAddress).repay(wETH, _amount, 2, address(this));
-
-        emit Repay(msg.sender, _amount);
-    }
-
-    function withdraw(uint256 _amount) external {
+    function withdraw(uint256 _amount) external nonReentrant {
+        require(_amount > 0, "Invalid amount");
+        require(balanceOf[msg.sender] >= _amount, "Exceeded amount");
+        
+        // Withdraw wstETH from Aave
         address poolAddress = IPoolAddressProvider(provider).getPool();
 
         IERC20(aWstETH).approve(poolAddress, _amount);
         IPool(poolAddress).withdraw(wstETH, _amount, address(this));
 
+        balanceOf[msg.sender] -= _amount;
+        totalSupply -= _amount;
         IERC20(wstETH).safeTransfer(msg.sender, _amount);
 
         emit Withdraw(msg.sender, _amount);
     }
 
-    /**
-     * @dev use flashloan of balancer vault instead of leverage looping
-     * flashloan callback, called by balancer vault
-     */
-    function receiveFlashLoan(
-        address[] memory,
-        uint256[] memory,
-        uint256[] memory feeAmounts,
-        bytes calldata params
-    ) external nonReentrant {
-        if (msg.sender != balancerVault) revert NOT_BALANCER();
-
-        uint256 feeAmount = 0;
-        if (feeAmounts.length > 0) {
-            feeAmount = feeAmounts[0];
-        }
-        if (flashMode == 1) _flAddLeverage(params, feeAmount);
-        /* if (flashMode == 2) _flRemoveLeverage(params, feeAmount);
-        if (flashMode == 3) _flSwitchAsset(params, feeAmount);
-        if (flashMode == 4) _flSwitchDebt(params, feeAmount);
-        if (flashMode == 5) _flCloseLeverage(params, feeAmount); */
-    }
-
-    /**
-     * @dev process:
-     * flashloan the expected debt -> swap the expected debt to asset -> 
-     * supply the asset -> borrow to repay the flashloan
-     */
-    function addLeverage(uint256 _amount, uint256 _debt) external {
+    function harvest() external onlyRole(MANAGER_ROLE) nonReentrant {
+        // get pool address via address provider
         address poolAddress = IPoolAddressProvider(provider).getPool();
-        if (_amount > 0) {
-            IERC20(wstETH).safeTransferFrom(msg.sender, address(this), _amount);
+        
+        // borrow wETH from Aave
+        uint256 amountToBorrow = _calcBorrowAmount(address(this));
+        require(amountToBorrow > 0, "Cant borrow ETH");
 
-            // supply
-            IERC20(wstETH).approve(poolAddress, _amount);
-            IPool(poolAddress).supply(wstETH, _amount, address(this), 0);
-        }
+        IERC20(wETH).approve(poolAddress, amountToBorrow);
+        IPool(poolAddress).borrow(wETH, amountToBorrow, 2, 0, address(this));
 
-        if (_debt > 0) {
-            // execute flashloan
-            bytes memory params = abi.encode(_debt, poolAddress);
-            address[] memory tokens = new address[](1);
-            tokens[0] = wETH;
-            uint256[] memory amounts = new uint256[](1);
-            amounts[0] = _debt;
-            flashMode = 1; // addLeverage
+        uint256 outAmountDebt = _swapExactInputSingle(wETH, wstETH, 3000, amountToBorrow);
 
-            IFlashLoans(
-                balancerVault
-            ).flashLoan(address(this), tokens, amounts, params);
+        // Todo
+    }
+    
+    function _calcBorrowAmount(address _user) internal view returns (uint256) {
+        address poolAddress = IPoolAddressProvider(provider).getPool();
+        // get account data
+        (, , uint256 availableBorrowsBase, , ,) = IPool(poolAddress).getUserAccountData(_user);
 
-            flashMode = 0;
-        }
+        // get ETH Price in base currency
+        address priceOracleAddress = IPoolAddressProvider(provider).getPriceOracle();
+        uint256 ethPrice = IPriceOracleGetter(priceOracleAddress).getAssetPrice(wETH);
 
-        emit LeverageAdded(msg.sender, _amount, _debt);
+        require(ethPrice > 0, "Invalid oracle info");
+        return availableBorrowsBase / ethPrice;
     }
 
-    function _flAddLeverage(bytes calldata _params, uint256 _feeAmount) internal {
-        // decode params
-        (uint256 amount, address poolAddress) = abi.decode(_params, (uint256, address));
-
-        // swap debt to asset
-        // the only solution to convert from memory to calldata
-        uint256 outAmountDebt = _swapBySelf(wETH, wstETH, 3000, amount);
-
-        // supply
-        IERC20(wstETH).approve(poolAddress, outAmountDebt);
-        IPool(poolAddress).supply(wstETH, outAmountDebt, address(this), 0);
-
-        // borrow the equivalent amount using our new collateral
-        IPool(poolAddress).borrow(wETH, amount + _feeAmount, 2, 0, address(this));
-
-        // repay debt Flashloan
-        IERC20(wETH).safeTransfer(balancerVault, amount + _feeAmount);
-    }
-
-    function _swapBySelf(
+    function _swapExactInputSingle(
         address _tokenIn,
         address _tokenOut,
         uint24 _poolFee,
